@@ -1,6 +1,8 @@
 # Bridging Neural Networks and Wireless Systems with MIMO-OFDM Semantic Communications
 [huggingface]: https://huggingface.co/wintersummer01/semantic-mimo-ofdm/tree/main
 
+<img width="1889" height="566" alt="image" src="https://github.com/user-attachments/assets/3c0b1530-53d8-4537-b1c4-1aaede6f6f3b" />
+
 This repository contains the code for the paper  
 [Bridging Neural Networks and Wireless Systems with MIMO-OFDM Semantic Communications](https://ieeexplore.ieee.org/abstract/document/11175613).  
 Data and model checkpoints for the semantic server are available at [Hugging Face][huggingface].
