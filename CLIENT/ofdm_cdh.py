@@ -54,6 +54,8 @@ class OFDM_FrameGenerator:
         self.pilot_idx = np.where(self.data_map == 1)
         self.data_idx = np.where(self.data_map == 0)
         
+        self.reverse_idx = np.where(self.data_map.T == 0)
+
         self.sync_symbols = generateZadoffChuSymbols(self.sync_idx[0].size)
         sync_frame = np.zeros_like(self.data_map, dtype=np.complex64)
         sync_frame[self.sync_idx] = self.sync_symbols
@@ -93,7 +95,7 @@ class OFDM_FrameGenerator:
         
         if self.sequential_mapping:
             symbols = self.control_iqs.copy().T
-            self.reverse_idx = np.where(self.data_map.T == 0)
+            # self.reverse_idx = np.where(self.data_map.T == 0)
             symbols[self.reverse_idx] = data
             symbols = symbols.T
         else:
