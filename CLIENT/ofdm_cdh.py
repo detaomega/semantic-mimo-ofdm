@@ -255,7 +255,14 @@ class OFDM_FrameGenerator:
             
         # --- (修改) ---
         try:
-            corr = np.abs(scipy.signal.correlate(rcv_signal, self.short_sync_waveform, 'valid'))
+            # 舊的、對CFO敏感的方法:
+            # corr = np.abs(scipy.signal.correlate(rcv_signal, self.short_sync_waveform, 'valid'))
+            
+            # 新的、對CFO穩健的方法：在「功率」上進行相關
+            rcv_power = np.abs(rcv_signal)**2
+            template_power = np.abs(self.short_sync_waveform)**2
+            
+            corr = scipy.signal.correlate(rcv_power, template_power, 'valid')
             
             # 找到最大峰值
             peak_idx = np.argmax(corr)
@@ -273,7 +280,6 @@ class OFDM_FrameGenerator:
             est_idx = -1
 
         return est_idx
-    
     def get_mimo_channel(self, symbols):
         '''
         return: estimated mimo channel with shape [num_subcarriers, num_tx, num_pilot_slots]
