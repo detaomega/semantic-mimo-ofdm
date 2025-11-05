@@ -60,6 +60,15 @@ class OFDM_FrameGenerator:
         sync_frame = np.zeros_like(self.data_map, dtype=np.complex64)
         sync_frame[self.sync_idx] = self.sync_symbols
         self.sync_signal = self.symbolsToSignal(sync_frame)
+        # ----- modify this part
+        sync_signal_waveform_obj = self.symbolsToSignal(sync_frame)
+        sync_signal_waveform = sync_signal_waveform_obj.signal
+        sync_signal_waveform[822:960] /= 1.7
+
+        sync_signal_waveform_obj.signal = sync_signal_waveform
+        self.sync_signal = sync_signal_waveform_obj
+        
+        # ----- modify this part
         
         self.pilot = generatePilotSymbols(self.pilot_idx[0].size, QAM_order=4, seed=1030)
         self.ref_pilot_channel = np.ones_like(self.data_map, dtype=np.complex64)
