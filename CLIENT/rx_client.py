@@ -8,7 +8,7 @@
 import numpy as np
 import uhd
 import matplotlib.pyplot as plt
-from IPython import display
+# (移除了 from IPython import display)
 import time
 
 from utils import interleave
@@ -16,15 +16,15 @@ from ofdm_cdh import OFDM_FrameGenerator
 
 # --- 接收器設定 ---
 SERIAL_RX = "34B733A"       # 您的 B200mini 序列號
-RX_GAIN = 24.0              # 接收增益 (dB)
+RX_GAIN = 60.0              # 接收增益 (dB)
 GT_FILE = 'gt_data.npz'     # Ground Truth 檔案
 # --------------------
 
 # --- OFDM 參數 ---
 Fs = 15 * 128 * 1000
-Fc = 2.0e9
+Fc = 5.1e9 # 必須與 Tx 相同
 N = 28.0 # Payload normalization (必須與 Tx 相同)
-PILOT_NORM = 4.0
+# PILOT_NORM = 4.0 # 已移至 ofdm_cdh.py 內部
 
 # --- 1. 初始化 OFDM Mapper (1x1 SISO) ---
 print("Initializing OFDM mapper...")
@@ -69,16 +69,15 @@ stream_args = uhd.usrp.StreamArgs("fc32", "sc16")
 stream_args.channels = [0]
 rx_streamer = usrp_rx.get_rx_stream(stream_args)
 
-num_samps_to_recv = int(N_SAMPLES_PER_FRAME * 1.5) 
+num_samps_to_recv = int(N_SAMPLES_PER_FRAME * 2.5) 
 recv_buffer = np.zeros(num_samps_to_recv, dtype=np.complex64)
 print(f"Receiver buffer created (size: {num_samps_to_recv})")
 
-# --- 6. 準備繪圖 (移除影像) ---
+# --- 6. 準備繪圖 ---
 print("Setting up live plot...")
 plt.ion()
 fig, (ax1, ax2, ax3) = plt.subplots(ncols=3, nrows=1, figsize=(18, 5))
 fig.tight_layout(pad=4.0)
-# dh = display.display(fig, display_id=True)
 
 # --- 7. 連續接收與處理 ---
 print("\n*** Starting continuous reception... (Press Ctrl+C to stop) ***")
@@ -86,15 +85,18 @@ stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
 stream_cmd.stream_now = True
 rx_streamer.issue_stream_cmd(stream_cmd)
 metadata = uhd.types.RXMetadata()
-frame_counter = 0
-PLOT_EVERY_N_FRAMES = 10
+
+frame_counter = 0 
+PLOT_EVERY_N_FRAMES = 30
 try:
     while True:
-        frame_counter += 1
         # 1. 接收 Smaples
         num_rx_samps = rx_streamer.recv(recv_buffer, metadata)
         
-        if metadata.error_code != uhd.types.RXMetadataErrorCode.none:
+        if metadata.error_code == uhd.types.RXMetadataErrorCode.overflow:
+            print("O", end="", flush=True) 
+            continue 
+        elif metadata.error_code != uhd.types.RXMetadataErrorCode.none:
             print(f"Receiver Error: {metadata.strerror()}")
             continue
             
@@ -102,69 +104,80 @@ try:
         est_idx = mapper.synchronize(recv_buffer)
         
         if est_idx < 0 or (est_idx + N_SAMPLES_PER_FRAME) > num_samps_to_recv:
-            print(f"Sync failed (est_idx: {est_idx}). Flushing buffer...")
-            rx_streamer.recv(recv_buffer, metadata)
-            continue
+            print("S", end="", flush=True) # "S" for Sync failed
+            continue 
 
         # 3. 擷取訊框
         rcv_waveform = recv_buffer[est_idx : est_idx + N_SAMPLES_PER_FRAME]
         
-        # 4. 功率調整
-        rcv_waveform_copy = rcv_waveform.copy()
-        rcv_waveform_copy[822:960] *= 1.7
-        rcv_waveform_copy = rcv_waveform_copy.reshape(-1, 960)
-        rcv_waveform_copy[:,:138] *= (PILOT_NORM / np.sqrt(1))
-        rcv_waveform_copy = rcv_waveform_copy.flatten()
-
+        # 4. 功率調整 (已移除 - 移至 OFDM_FrameGenerator.signalToSymbols 內部)
+        
         # 5. FFT
-        rcv_symbol = mapper.signalToSymbols(rcv_waveform_copy)
+        # signalToSymbols 現在會自動處理功率調整
+        rcv_symbol = mapper.signalToSymbols(rcv_waveform)
         
         # 6. 通道估測與均衡
-        channels = mapper.get_mimo_channel(rcv_symbol)
-        channels = np.stack([channels], axis=1) # 增加 'rx' 維度
-        
-        rcv_symbol = rcv_symbol.reshape(rcv_symbol.shape[0], 1, rcv_symbol.shape[1]) # 增加 'rx' 維度
-        rcv_symbols_zf = mapper.mimo_zf_equalize(rcv_symbol, channels)
+        # 使用 SISO 的 equalize 方法
+        channels_for_plot = mapper.get_mimo_channel(rcv_symbol) # 僅用於繪圖
+        rcv_symbols_eq = mapper.equalize(rcv_symbol) # 實際的均衡
         
         # 7. 擷取 Payload
-        rcv_payload = mapper.extractPayloads(rcv_symbols_zf[0])
+        rcv_payload = mapper.extractPayloads(rcv_symbols_eq)
         rcv_payload = rcv_payload[:payload_length].astype(np.complex64)
-        
-        rcv_payload *= N # 反正規化
+        rcv_payload *= N 
 
         # 8. 計算 ESNR
-        sym_pow = np.mean(np.abs(gt_payload) ** 2)
-        err_pow = np.mean(np.abs(gt_payload - rcv_payload) ** 2)
-        esnr = 10*np.log10(sym_pow/err_pow)
-
-        # 9. 更新繪圖
+        sym_pow = np.mean(np.abs(gt_payload)**2)
+        err_pow = np.mean(np.abs(gt_payload - rcv_payload)**2)
+        esnr = 10*np.log10(sym_pow / err_pow)
+        
+        frame_counter += 1
+        
+        # 9. 只有在需要時才繪圖
         if frame_counter % PLOT_EVERY_N_FRAMES == 0:
             print(f" [Plotting Update: ESNR {esnr:.2f} dB] ", end="", flush=True)
+            
+            # --- 圖 1: 通道 (ax1) ---
             ax1.clear()
-            d = np.linalg.svd(np.mean(channels, axis=-1)[0], compute_uv=False)
-            ax1.plot(d)
+            # 繪製通道的振幅響應 (對 pilot 取平均)
+            channel_mag = np.abs(np.mean(channels_for_plot, axis=-1)[0])
+            ax1.plot(channel_mag)
             ax1.set_xlim([0, 72])
+            ax1.set_ylim(bottom=0)
             ax1.set_xlabel('Subcarrier Index')
             ax1.set_ylabel('Channel Magnitude')
-            ax1.set_title('SISO Channel Singular Values')
+            ax1.set_title('SISO Channel Magnitude')
             
+            # --- 圖 2: PSD (ax2) ---
             ax2.clear()
             ax2.psd(recv_buffer, NFFT=1024, Fs=Fs, scale_by_freq=False, linewidth=0.1)
             ax2.set_title('Received Signal PSD')
 
+            # ==================== MODIFIED BLOCK ====================
+            # --- 圖 3: 星座圖 (ax3) ---
             ax3.clear()
-            ax3.scatter(np.real(rcv_payload), np.imag(rcv_payload), s=0.5, alpha=0.5)
+            
+            # 1. 繪製接收到的訊號 (藍色點雲)
+            ax3.scatter(np.real(rcv_payload), np.imag(rcv_payload), 
+                        s=0.5, alpha=0.3, label='Received (Rx)')
+            
+            # 2. 疊加繪製 Ground Truth (橘色點)
+            ax3.scatter(np.real(gt_payload), np.imag(gt_payload), 
+                        s=2, alpha=0.8, color='orange', label='Ground Truth (GT)')
+
             ax3.set_xlim([-1.5, 1.5]) 
             ax3.set_ylim([-1.5, 1.5])
             ax3.set_xlabel('In-Phase')
             ax3.set_ylabel('Quadrature-Phase')
-            ax3.set_title(f'Constellation | ESNR:{esnr:.2f} dB')
+            ax3.set_title(f'Constellation | ESNR:{esnr:.2f} dB, MSE: {err_pow:.4f}')
+            ax3.legend() # <-- 顯示圖例
+            ax3.grid(True)
+            ax3.set_aspect('equal') # 保持 I/Q 軸 1:1
+            # ======================================================
             
-
             fig.canvas.draw()
             fig.canvas.flush_events()
             plt.pause(0.001)
-        # dh.update(fig)
 
 except KeyboardInterrupt:
     print("\nStopping reception...")

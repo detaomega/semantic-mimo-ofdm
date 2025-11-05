@@ -4,10 +4,17 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 import matplotlib.cm as cm
 
+# 假設 USRP_signal 和 generate... 函式存在於此或已被 import
 from usrp_signal import USRP_signal
 from utils import generateZadoffChuSymbols, generatePilotSymbols
     
 class OFDM_FrameGenerator:
+    
+    # --- 內部常數 ---
+    _PILOT_NORM = 4.0
+    _SYNC_SCALE = 1.7 # 從 "神秘數字" 1.7 轉換而來
+    # ----------------
+    
     def __init__(self, num_subcarriers, DC_guard, symbols_per_slot, slots_per_frame, pilot_place, sync_place,
                  subcarrier_spacing, FFT_size, num_cp_samples, num_ex_cp_samples, sequential_mapping, initial_pad,
                  num_antenna, antenna_idx):
@@ -21,10 +28,15 @@ class OFDM_FrameGenerator:
         self.subcarrier_spacing = subcarrier_spacing
         self.FFT_size = FFT_size
         self.sampling_rate = subcarrier_spacing * FFT_size
-        self.num_cp_samples = num_cp_samples
-        self.num_ex_cp_samples = num_ex_cp_samples
-        self.add_cp = num_ex_cp_samples - num_cp_samples
-        self.n_samples_per_frame = ((self.FFT_size + self.num_cp_samples) * self.symbols_per_slot + self.add_cp) * self.slots_per_frame
+        self.num_cp_samples = num_cp_samples # 9
+        self.num_ex_cp_samples = num_ex_cp_samples # 10
+        self.add_cp = num_ex_cp_samples - num_cp_samples # 1
+        
+        # 訊框結構: 1 個長 CP (138) + 6 個短 CP (137) = 138 + 822 = 960 samples/slot
+        self.n_samples_per_slot = (self.FFT_size + self.num_ex_cp_samples) + \
+                                  (self.symbols_per_slot - 1) * (self.FFT_size + self.num_cp_samples)
+        self.n_samples_per_frame = self.n_samples_per_slot * self.slots_per_frame # 960 * 50 = 48000
+        
         self.num_antenna = num_antenna
         self.antenna_idx = antenna_idx
         
@@ -59,21 +71,46 @@ class OFDM_FrameGenerator:
         self.sync_symbols = generateZadoffChuSymbols(self.sync_idx[0].size)
         sync_frame = np.zeros_like(self.data_map, dtype=np.complex64)
         sync_frame[self.sync_idx] = self.sync_symbols
-        self.sync_signal = self.symbolsToSignal(sync_frame)
-        # ----- modify this part
-        sync_signal_waveform_obj = self.symbolsToSignal(sync_frame)
-        waveform = sync_signal_waveform_obj.signal
-        PILOT_NORM = 4.0
-        waveform[822:960] /= 1.7
-        waveform = waveform.reshape(-1, 960)
-        waveform[:,:138] /= (PILOT_NORM / np.sqrt(self.num_antenna))
-        sync_signal_waveform = sync_signal_waveform_obj.signal
-        waveform = waveform.flatten()
-        sync_signal_waveform_obj.signal = waveform
-        self.sync_signal = sync_signal_waveform_obj
         
-        # ----- modify this part
+        # --- (新增) 計算 Sync Symbol 的樣本偏移量 ---
+        # (sync_place+1)*symbols_per_slot-1 = (0+1)*7-1 = 6 (第 7 個 symbol, 索引 6)
+        sync_symbol_frame_idx = (self.sync_place+1)*self.symbols_per_slot-1 
+        
+        # 動態計算 Symbol 0 到 Symbol 6 (不含) 的總樣本數
+        offset = 0
+        for i in range(sync_symbol_frame_idx):
+            symbol_in_slot = i % self.symbols_per_slot
+            if symbol_in_slot == self.pilot_place: # 假設 pilot_place = 0
+                offset += (self.FFT_size + self.num_ex_cp_samples) # 138 (Symbol 0)
+            else:
+                offset += (self.FFT_size + self.num_cp_samples) # 137 (Symbol 1-5)
+        
+        # 儲存這個偏移量 (138 + 5 * 137 = 823)
+        self.sync_symbol_start_offset = offset
+        # --- (新增結束) ---
 
+        
+        # --- (產生用於高效同步的「短同步訊號」 (137 samples)) ---
+        
+        # 1. 取得單一 Sync Symbol (頻域) (索引 6)
+        sync_symbol_freq_domain = sync_frame[:, sync_symbol_frame_idx]
+
+        # 2. IFFT
+        sync_symbol_time = np.fft.fftshift(sync_symbol_freq_domain)
+        sync_symbol_time = np.fft.ifft(sync_symbol_time, n=self.FFT_size, norm='ortho') * np.sqrt(self.FFT_size/self.num_subcarriers)
+        
+        # 3. 加 CP (Sync symbol 是第 7 個, 索引 6, 用短 CP)
+        cp_len = self.num_cp_samples # 9
+        cp = sync_symbol_time[-cp_len:]
+        sync_symbol_with_cp = np.hstack([cp, sync_symbol_time])
+        
+        # 4. 應用 Tx 功率調整 (除法)
+        sync_symbol_with_cp /= self._SYNC_SCALE
+        
+        # 5. 儲存
+        self.short_sync_waveform = sync_symbol_with_cp.astype(np.complex64)
+        # --- (修改結束) ---
+        
         self.pilot = generatePilotSymbols(self.pilot_idx[0].size, QAM_order=4, seed=1030)
         self.ref_pilot_channel = np.ones_like(self.data_map, dtype=np.complex64)
         self.ref_pilot_channel[self.pilot_idx] = self.pilot
@@ -83,8 +120,6 @@ class OFDM_FrameGenerator:
         self.control_iqs[self.pilot_idx] = self.pilot
         self.num_data = np.count_nonzero(self.data_map==0)
         self.sequential_mapping = sequential_mapping
-        
-        
     def showMap(self):
         plt.figure(figsize=(14, 8))
         norm = colors.BoundaryNorm([0, 1, 2, 3, 4], cm.viridis.N)
@@ -108,7 +143,6 @@ class OFDM_FrameGenerator:
         
         if self.sequential_mapping:
             symbols = self.control_iqs.copy().T
-            # self.reverse_idx = np.where(self.data_map.T == 0)
             symbols[self.reverse_idx] = data
             symbols = symbols.T
         else:
@@ -118,16 +152,42 @@ class OFDM_FrameGenerator:
         return symbols
         
     def symbolsToSignal(self, symbols):
+        # IFFT
         signal_wo_cp = np.fft.fftshift(symbols, axes=0)
         signal_wo_cp = np.fft.ifft(signal_wo_cp, n=self.FFT_size, axis=0, norm='ortho') * np.sqrt(self.FFT_size/self.num_subcarriers)
-        signal_wo_cp = np.transpose(signal_wo_cp)
-        self.a = signal_wo_cp
+        signal_wo_cp = np.transpose(signal_wo_cp) # Shape (num_total_symbols, FFT_size) = (350, 128)
         
-        # Add CP
-        signal = np.hstack([signal_wo_cp[:,-self.num_cp_samples:], signal_wo_cp])
-        signal = signal.reshape([self.slots_per_frame, -1])
-        signal = np.hstack([signal[:,self.FFT_size-self.add_cp:self.FFT_size], signal])
-        signal = signal.flatten().astype(np.complex64)
+        # --- (重構) ---
+        # 根據 138 + 6*137 結構，逐一 Symbol 加入 CP 和功率調整
+        n_symbols_total = self.symbols_per_slot * self.slots_per_frame
+        signals_with_cp = []
+        
+        symbol_index_sync = (self.sync_place+1)*self.symbols_per_slot-1 # Sync symbol 的絕對索引 (6)
+
+        for i in range(n_symbols_total):
+            symbol_data = signal_wo_cp[i, :]
+            symbol_in_slot = i % self.symbols_per_slot
+
+            # 1. 決定 CP 長度
+            if symbol_in_slot == self.pilot_place: # 假設 pilot_place 總是第一個 symbol (0)
+                cp_len = self.num_ex_cp_samples # 10
+            else:
+                cp_len = self.num_cp_samples # 9
+            
+            cp = symbol_data[-cp_len:]
+            symbol_with_cp = np.hstack([cp, symbol_data])
+
+            # 2. 功率調整 (Tx)
+            if symbol_in_slot == self.pilot_place:
+                symbol_with_cp /= (self._PILOT_NORM / np.sqrt(self.num_antenna))
+            
+            if i == symbol_index_sync: # 只調整第一個 slot 的 sync symbol
+                symbol_with_cp /= self._SYNC_SCALE
+
+            signals_with_cp.append(symbol_with_cp)
+        
+        signal = np.concatenate(signals_with_cp).flatten().astype(np.complex64)
+        # --- (重構結束) ---
         
         return USRP_signal(initial_symbols=signal,
                                 tone_Fs=self.sampling_rate,
@@ -137,15 +197,46 @@ class OFDM_FrameGenerator:
         if isinstance(signal, USRP_signal):
             signal = signal.signal
         
-        # Remove CP
-        signal = signal.reshape([self.slots_per_frame, -1])
-        signal = signal[:,self.add_cp:]
-        signal = signal.reshape([self.symbols_per_slot*self.slots_per_frame, -1])
-        signal = signal[:,self.num_cp_samples:]
+        # --- (重構) ---
+        # 根據 138 + 6*137 結構，逐一 Symbol 移除 CP 和反向功率調整
+        symbols_wo_cp = []
+        current_idx = 0
+        n_symbols_total = self.symbols_per_slot * self.slots_per_frame
         
+        symbol_index_sync = (self.sync_place+1)*self.symbols_per_slot-1 # Sync symbol 的絕對索引 (6)
+        
+        for i in range(n_symbols_total):
+            symbol_in_slot = i % self.symbols_per_slot
+
+            # 1. 決定 Symbol 長度
+            if symbol_in_slot == self.pilot_place:
+                cp_len = self.num_ex_cp_samples # 10
+                symbol_len = self.FFT_size + cp_len # 138
+            else:
+                cp_len = self.num_cp_samples # 9
+                symbol_len = self.FFT_size + cp_len # 137
+            
+            symbol_with_cp = signal[current_idx : current_idx + symbol_len]
+
+            # 2. 功率調整 (Rx - 反向)
+            if symbol_in_slot == self.pilot_place:
+                symbol_with_cp *= (self._PILOT_NORM / np.sqrt(self.num_antenna))
+
+            if i == symbol_index_sync:
+                symbol_with_cp *= self._SYNC_SCALE
+            
+            # 3. 移除 CP
+            symbol_data = symbol_with_cp[cp_len:]
+            symbols_wo_cp.append(symbol_data)
+            
+            current_idx += symbol_len
+        
+        signal_stacked = np.stack(symbols_wo_cp) # Shape (350, 128)
+        # --- (重構結束) ---
+
         # FFT
-        signal = np.transpose(signal)
-        symbols = np.fft.fft(signal, n=self.FFT_size, axis=0, norm='ortho') / np.sqrt(self.FFT_size/self.num_subcarriers)
+        signal_transposed = np.transpose(signal_stacked) # Shape (128, 350)
+        symbols = np.fft.fft(signal_transposed, n=self.FFT_size, axis=0, norm='ortho') / np.sqrt(self.FFT_size/self.num_subcarriers)
         symbols = np.fft.fftshift(symbols, axes=0)
         return symbols
     
@@ -162,16 +253,32 @@ class OFDM_FrameGenerator:
         if isinstance(rcv_signal, USRP_signal):
             rcv_signal = rcv_signal.signal
             
-        corr = np.abs(scipy.signal.correlate(rcv_signal, self.sync_signal.signal, 'full'))
-        est_idx = (np.argmax(corr) + 1) % self.n_samples_per_frame 
+        # --- (修改) ---
+        try:
+            corr = np.abs(scipy.signal.correlate(rcv_signal, self.short_sync_waveform, 'valid'))
+            
+            # 找到最大峰值
+            peak_idx = np.argmax(corr)
+            
+            # (關鍵修正) 
+            # peak_idx 是「同步訊號」的開頭
+            # 我們要回傳的是「訊框」的開頭
+            est_idx = peak_idx - self.sync_symbol_start_offset
+            
+            # 確保索引是有效的
+            if est_idx < 0:
+                est_idx = -1
+
+        except ValueError:
+            est_idx = -1
 
         return est_idx
-
+    
     def get_mimo_channel(self, symbols):
         '''
         return: estimated mimo channel with shape [num_subcarriers, num_tx, num_pilot_slots]
         '''
-
+        # (此函式保持不變, 供 SISO 繪圖或未來 MIMO 擴展使用)
         mimo_ref_pilot = np.repeat(np.reshape(self.pilot, (self.num_subcarriers//self.num_antenna, -1)), self.num_antenna, axis=0)
         pilot_rcv = np.concatenate([
             symbols[self.leading_guard_end_idx+1:self.dc_start_idx,self.pilot_place::self.symbols_per_slot],
@@ -185,6 +292,7 @@ class OFDM_FrameGenerator:
         return intp_mimo_est_channel
 
     def mimo_zf_equalize(self, symbols, mimo_channel):
+        # (此函式保持不變, 供未來 MIMO 擴展使用)
         '''
         symbols: (FFT_size, num_rx, num_slots)
         mimo_channel: (num_subcarriers, num_rx, num_tx, num_pilot_slots)
@@ -199,7 +307,6 @@ class OFDM_FrameGenerator:
 
         # Linear interpolation
         est_channel = np.concatenate([est_channel, est_channel[...,-self.symbols_per_slot:]], axis=-1)
-        # est_channel = np.concatenate([mimo_channel, mimo_channel[...,-self.symbols_per_slot:]], axis=-1)
 
         i, j = self.data_idx
         d = np.reshape((j % self.symbols_per_slot) / self.symbols_per_slot, (-1, 1, 1))
@@ -207,19 +314,12 @@ class OFDM_FrameGenerator:
         data_channel = d * est_channel[i, ..., ref_idx] + (1-d) * est_channel[i, ..., ref_idx+self.symbols_per_slot]
         
         mimo_channel_intp = np.random.normal(0., 1., est_channel[..., :-self.symbols_per_slot].shape).astype(np.complex64)
-        # Due to pilot slot, singular matrix occur when np.zeros or ones()
-        # So initialize it to random matrix 
-
         mimo_channel_intp[i, ..., j] = data_channel
-        # (FFT_size, num_rx, num_tx, num_slots)
-
         mimo_channel_intp = np.concatenate(
             (mimo_channel_intp[self.leading_guard_end_idx+1:self.dc_start_idx],
              mimo_channel_intp[self.dc_end_idx+1:self.trailing_guard_start_idx]), axis=0)
-
         mimo_channel_intp = np.transpose(mimo_channel_intp, (0, 3, 1, 2))
-        # (num_subcarriers, num_slots, num_rx, num_tx)
-
+        
         mimo_channel_inv = np.linalg.inv(mimo_channel_intp)
         
         symbols_valid = np.concatenate(
@@ -235,63 +335,22 @@ class OFDM_FrameGenerator:
         return symbols_eq
 
     def zf_precode(self, symbols, mimo_channel):
+        # (此函式保持不變, 供未來 MIMO 擴展使用)
         '''
         symbols: (FFT_size, num_rx, num_slots)
         mimo_channel: (num_subcarriers, num_rx, num_tx, 1)
         '''
-        # Do not use ZF precoding to sync signal
         sync_signal = symbols[..., (self.sync_place+1)*self.symbols_per_slot-1].T
-        # (num_rx, FFT_size)
-
         num_subcarriers, num_rx, num_tx, _ = mimo_channel.shape
         mimo_channel = np.broadcast_to(mimo_channel, (num_subcarriers, num_rx, num_tx, self.symbols_per_slot*self.slots_per_frame))
         
-        # Expand mimo_channel to FFT_size
         est_channel = np.reshape(np.identity(num_rx), (1, num_rx, num_tx, 1)) + 0.0j
         est_channel = np.broadcast_to(est_channel, (self.FFT_size, num_rx, num_tx, self.symbols_per_slot*self.slots_per_frame)).copy()
-
         est_channel[self.leading_guard_end_idx+1:self.dc_start_idx] = mimo_channel[:self.dc_start_idx-self.leading_guard_end_idx-1]
         est_channel[self.dc_end_idx+1:self.trailing_guard_start_idx] = mimo_channel[self.trailing_guard_start_idx-self.dc_end_idx-1:] 
-
         est_channel = np.transpose(est_channel, (0, 3, 1, 2))
-        # (FFT_size, num_slots, num_rx, num_tx)
-
-        # U, D, Vh = np.linalg.svd(est_channel)
-
-        # num_subcarriers, time_idx, num_rx = D.shape
-
-        # # D_ = np.mean(np.mean(D, axis=0, keepdims=True), axis=1, keepdims=True)
-        # # D_ /= np.sqrt(np.sum(D_**2))
-        # # D_ = np.broadcast_to(D_, D.shape)
-
-        # # # Normalize D
-        # # D_wo_guardband = np.concatenate([D[:dc_idx-leading_guard_end_idx-1], D[dc_idx-leading_guard_end_idx-1:]], axis=0)
-        # # norm_const = np.mean(D_wo_guardband)
-        # # D[:dc_idx-leading_guard_end_idx-1] /= norm_const
-        # # D[dc_idx-leading_guard_end_idx-1:] /= norm_const
-
-        # D_matrix = np.zeros((num_subcarriers, time_idx, num_rx, num_rx))
-
-        # # D = np.clip(D, 1/2, 1.)
-        # # plt.plot(1. / D.flatten())
-        # # plt.show()
-
-        # i, j = np.diag_indices(num_rx)
-        # D_matrix[:, :, i, j] = D
-
-        # precode_matrix = np.einsum('...ij,...jk->...ik', D_matrix, Vh)
-        # mimo_channel_inv = np.linalg.inv(precode_matrix)
-        # mimo_channel_inv = Vh
-        # mimo_channel_inv = np.linalg.inv(Vh)
-
-        # print(np.mean(D, axis=(0, 1)))
-        # norm_factor = 1 / np.mean(D, axis=(0, 1), keepdims=True)
-        # norm_factor = norm_factor / np.sum(norm_factor, axis=-1)
-
-        # mimo_channel_inv /= np.expand_dims(norm_factor, axis=-1)
-
+        
         mimo_channel_inv = np.linalg.inv(est_channel)
-
         norm_factor = np.sqrt(np.sum(mimo_channel_inv ** 2, axis=(-1, -2), keepdims=True))
         mimo_channel_inv /= norm_factor
         
@@ -301,29 +360,21 @@ class OFDM_FrameGenerator:
         return symbols_precoded
 
     def equalize(self, symbols):
+        # (此函式保持不變, 用於 SISO 均衡)
         # TODO : Now hardcoded for pilot_place = 0
         est_channel = symbols / self.ref_pilot_channel
         
         # Nearest neighbor interpolation
-        # Data map excl. guard bands
         payload_map = np.ones((self.num_subcarriers, self.symbols_per_slot*self.slots_per_frame), np.complex64)
-        
         payload_map[:self.dc_start_idx-self.leading_guard_end_idx-1] = est_channel[self.leading_guard_end_idx+1:self.dc_start_idx]
         payload_map[self.trailing_guard_start_idx-self.dc_end_idx-1:] = est_channel[self.dc_end_idx+1:self.trailing_guard_start_idx]
         
-        # Valid pilot
         valid_pilot = payload_map[self.antenna_idx::self.num_antenna,self.pilot_place::self.symbols_per_slot]
-
         intp_pilot = np.repeat(valid_pilot, self.num_antenna, axis=0)
-
         payload_map[:,self.pilot_place::self.symbols_per_slot] = intp_pilot
-        # intp value comprehended as (antenna_idx, val, num_antenna-antenna_idx-1)-sized subcarrier sequence
-
-        # Re assign into est_channel
         
         est_channel[self.leading_guard_end_idx+1:self.dc_start_idx] = payload_map[:self.dc_start_idx-self.leading_guard_end_idx-1]
         est_channel[self.dc_end_idx+1:self.trailing_guard_start_idx] = payload_map[self.trailing_guard_start_idx-self.dc_end_idx-1:]
-
 
         # Interpolation (time idx)
         est_channel = np.hstack([est_channel, est_channel[:,-self.symbols_per_slot:]]) #TODO
@@ -335,14 +386,12 @@ class OFDM_FrameGenerator:
         
         interpolated_channel = np.ones_like(self.data_map, dtype=np.complex64)
         interpolated_channel[i, j] = data_channel
-        symbols /= interpolated_channel
+        symbols_eq = symbols / interpolated_channel
         
-        return symbols
+        return symbols_eq
 
     def get_channel(self, symbols):
+        # (此函式保持不變)
         est_channel = symbols / self.ref_pilot_channel
         est_channel = np.hstack([est_channel, est_channel[:,-self.symbols_per_slot:]]) #TODO
-        
-        # avg_noise_pwr = np.var(est_channel - self.ref_pilot_channel, axis=-1)
-
         return np.mean(est_channel)

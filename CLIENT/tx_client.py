@@ -10,9 +10,9 @@ TX_GAIN = 15.0              # 發射增益 (dB)
 GT_FILE = 'gt_data.npz'     # 要讀取的 Ground Truth 檔案
 
 Fs = 15 * 128 * 1000
-Fc = 2.0e9
+Fc = 5.1e9                  # <<<--- 關鍵修改：必須與 Rx 相同
 N = 28.0 # Payload normalization
-PILOT_NORM = 4.0
+# PILOT_NORM = 4.0 # 已移至 ofdm_cdh.py 內部
 
 # --- 1. Initial OFDM Mapper (1x1 SISO) ---
 print("Initializing OFDM mapper...")
@@ -42,13 +42,12 @@ payload_norm = payload / N # 正規化
 payload_tx = payload_norm.reshape(-1, 1).T # shape (1, 512)
 
 symbol_frame = mapper.mapToFrame(payload_tx[0]) 
-waveform = mapper.symbolsToSignal(symbol_frame).signal # Perform IFFT
 
-# Adjust
-waveform[822:960] /= 1.7
-waveform = waveform.reshape(-1, 960)
-waveform[:,:138] /= (PILOT_NORM / np.sqrt(1))
-waveform = waveform.flatten()
+# symbolsToSignal 現在會自動處理 IFFT, CP 和功率調整
+waveform_obj = mapper.symbolsToSignal(symbol_frame)
+waveform = waveform_obj.signal 
+
+# (已移除) "Adjust" 區塊 - 功率調整邏輯已移至 mapper.symbolsToSignal 內部
 
 # Final Sending Sample
 tx_waveform = waveform.reshape(1, -1).astype(np.complex64)
