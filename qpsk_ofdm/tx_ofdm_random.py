@@ -3,8 +3,8 @@ import uhd
 import time
 
 # --- 設定 ---
-SERIAL_TX = "3475843"   # 你的 B210/Tx 序列號 (請確認)
-TX_GAIN = 40.0
+SERIAL_TX = "3475843"   # 你的 B210/Tx 序列號
+TX_GAIN = 70.0
 Fc = 5.4e9
 Fs = 1e6
 GT_FILE_LTF = 'ltf_data.npz'
@@ -14,8 +14,24 @@ GT_FILE_PAYLOAD = 'gt_simple.npz'
 FFT_size = 64
 CP_len = 16
 symbol_len = FFT_size + CP_len # 80
-num_data_carriers = 48
 num_data_symbols = 10
+num_data_carriers = 48
+
+# (!!! 關鍵修改 !!!)
+# 在 64 個 FFT 點的中央空出 8 個子載波來避開 DC 濾波器
+DC_NULLS = 8 
+num_data_carriers_per_side = num_data_carriers // 2 # 48 / 2 = 24
+# 計算子載波的索引
+total_used_block = num_data_carriers + DC_NULLS # 48 + 8 = 56
+data_block_start = (FFT_size - total_used_block) // 2 # (64 - 56) / 2 = 4
+data_left_start = data_block_start
+data_left_end = data_left_start + num_data_carriers_per_side # 4 + 24 = 28
+data_right_start = data_left_end + DC_NULLS # 28 + 8 = 36
+data_right_end = data_right_start + num_data_carriers_per_side # 36 + 24 = 60
+# 結論:
+# 左半邊: 索引 4 到 27 (共 24 個)
+# DC 缺口: 索引 28 到 35 (共 8 個)
+# 右半邊: 索引 36 到 59 (共 24 個)
 
 # --- 1. Preamble 函式 (保持不變) ---
 def create_preamble_sc(fft_size, cp_len):
@@ -27,27 +43,33 @@ def create_preamble_sc(fft_size, cp_len):
     return preamble_with_cp
 
 def create_ltf_time(fft_size, cp_len, ltf_freq_known):
-    """ (修改) 從已知的頻域序列產生時域波形 """
     ltf_time = np.fft.ifft(ltf_freq_known)
     ltf_with_cp = np.hstack([ltf_time[-cp_len:], ltf_time])
     return ltf_with_cp
 
-def create_data_time(fft_size, cp_len, num_data_carriers, arbitrary_payload_freq):
-    """ (修改) 從已知的頻域序列產生時域波形 """
+# (!!! 關鍵修改 !!!)
+def create_data_time(fft_size, cp_len, arbitrary_payload_freq):
+    """ (修改) 將 payload 映射到新的「帶有 DC 缺口」的子載波上 """
     num_symbols = arbitrary_payload_freq.shape[0]
     
     data_freq = np.zeros((num_symbols, fft_size), dtype=np.complex64)
-    start_idx = (fft_size - num_data_carriers) // 2
-    end_idx = start_idx + num_data_carriers
-    data_freq[:, start_idx:end_idx] = arbitrary_payload_freq
     
+    # 映射左半邊
+    payload_left = arbitrary_payload_freq[:, :num_data_carriers_per_side]
+    data_freq[:, data_left_start:data_left_end] = payload_left
+    
+    # 映射右半邊
+    payload_right = arbitrary_payload_freq[:, num_data_carriers_per_side:]
+    data_freq[:, data_right_start:data_right_end] = payload_right
+    
+    # IFFT
     data_time = np.fft.ifft(data_freq, axis=1)
     cp = data_time[:, -cp_len:]
     data_with_cp = np.hstack([cp, data_time])
     
     return data_with_cp.flatten()
 
-# --- 2. (!!! 關鍵修改 !!!) 從檔案讀取 Ground Truth ---
+# --- 2. 從檔案讀取 Ground Truth ---
 print("Loading Ground Truth files...")
 try:
     ltf_data = np.load(GT_FILE_LTF)
@@ -66,18 +88,13 @@ print("Generating simple OFDM frame...")
 
 preamble_sc = create_preamble_sc(FFT_size, CP_len)
 preamble_ltf = create_ltf_time(FFT_size, CP_len, ltf_freq_known)
-data_payload = create_data_time(
-    FFT_size, CP_len, num_data_carriers, gt_payload_freq
-)
+# (!!! 關鍵修改 !!!)
+data_payload = create_data_time(FFT_size, CP_len, gt_payload_freq)
 
-# 組合成一個完整的訊框
 tx_waveform = np.hstack([preamble_sc, preamble_ltf, data_payload])
-N_SAMPLES_PER_FRAME = len(tx_waveform) # 960 samples
-
-# 功率正規化
 tx_waveform = tx_waveform / np.max(np.abs(tx_waveform)) * 0.5
-tx_waveform = tx_waveform.astype(np.complex64).reshape(1, -1) # (1, 960)
-print(f"Waveform ready. Total samples: {N_SAMPLES_PER_FRAME}")
+tx_waveform = tx_waveform.astype(np.complex64).reshape(1, -1) 
+print(f"Waveform ready. Total samples: {len(tx_waveform[0])}")
 
 # --- 4. 連接 USRP ---
 print(f"Connecting to TX USRP (B210) at serial={SERIAL_TX}...")
