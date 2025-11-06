@@ -1,66 +1,107 @@
 import numpy as np
 import uhd
-import time
 import matplotlib.pyplot as plt
-from tqdm import tqdm
-
-from ofdm_cdh import OFDM_FrameGenerator
-SERIAL_RX = '34B733A'
-GT_FILE = "gt_payload_local.npz"
+import time
 
 # --- 設定 ---
-Fs = 15 * 128 * 1000
-Fc = 2.0e9
-Rx_gain = 24.0
-pilot_norm = 4.0
-payload_norm = 28.0
-num_Rx = 1
+SERIAL_RX = "34B733A"   # 您的 B200mini 序列號
+RX_GAIN = 60.0          # 接收增益 (dB)
+Fc = 5.4e9              # 載波頻率 (必須與 Tx 相同)
+Fs = 1e6                # 取樣率 (1 MHz)
 
-# --- 1. 初始化 OFDM Mapper (SISO) ---
-print("Initializing OFDM mapper for SISO Rx...")
-mapper = OFDM_FrameGenerator(
-    num_subcarriers=72, DC_guard=1, slots_per_frame=50, symbols_per_slot=7,
-    pilot_place=0, sync_place=0, subcarrier_spacing=15*1000, FFT_size=128,
-    num_cp_samples=9, num_ex_cp_samples=10, sequential_mapping=True,
-    initial_pad=True, 
-    num_antenna=1,
-    antenna_idx=0
-)
-N_SAMPLES_PER_FRAME = mapper.n_samples_per_frame
-PAYLOAD_LEN = mapper.num_data
+# --- OFDM 參數 (必須與 Tx 相同) ---
+FFT_size = 64
+CP_len = 16
+symbol_len = FFT_size + CP_len # 80
+# 訊框結構: 1xSC(80) + 1xLTF(80) + 10xData(800)
+N_SAMPLES_PER_FRAME = 960 
+N_DATA_SYMBOLS = 10
+N_DATA_CARRIERS = 48
+data_carrier_start = (FFT_size - N_DATA_CARRIERS) // 2
+data_carrier_end = data_carrier_start + N_DATA_CARRIERS
 
-# --- 2. 連接 USRP (接收器) ---
-print(f"Connecting to RX USRP at {SERIAL_RX}...")
+# -----------------------------------------------------------------
+# (!!! 關鍵修正：一個「正確且穩健」的 S&C 同步函式 !!!)
+# -----------------------------------------------------------------
+def find_schmidl_cox_peak(buffer, D):
+    """
+    執行 Schmidl-Cox 同步演算法 (自相關)
+    D = FFT_size / 2
+    """
+    # 我們只搜尋緩衝區的前半部分，以節省時間
+    search_len = len(buffer) // 2
+    if search_len < 2 * D:
+        return -1, 0
+
+    # 窗口 A: r[n]
+    window_A = buffer[:search_len-D]
+    # 窗口 B: r[n+D]
+    window_B = buffer[D:search_len]
+
+    # P[n] = sum( r[n+k+D] * conj(r[n+k]) )
+    P_n = window_B * window_A.conj()
+    P = np.convolve(P_n, np.ones(D), 'valid')
+
+    # R_A[n] = sum( |r[n+k]|^2 )
+    R_A_n = np.abs(window_A)**2
+    R_A = np.convolve(R_A_n, np.ones(D), 'valid')
+
+    # R_B[n] = sum( |r[n+k+D]|^2 )
+    R_B_n = np.abs(window_B)**2
+    R_B = np.convolve(R_B_n, np.ones(D), 'valid')
+    
+    # 避免除以零
+    R_A[R_A == 0] = 1e-10
+    R_B[R_B == 0] = 1e-10
+    
+    # 穩健的度量 M[n] = |P[n]|^2 / (R_A[n] * R_B[n])
+    M = (np.abs(P)**2) / (R_A * R_B)
+    
+    # 找到相關峰值 (這是 S&C 前導碼的開頭)
+    peak_idx = np.argmax(M)
+    
+    # (關鍵) 估計 CFO
+    cfo_phase_per_sample = np.angle(P[peak_idx]) / D
+    
+    print(f"Schmidl-Cox: peak at {peak_idx}, CFO phase: {cfo_phase_per_sample:.4f} rad/sample")
+    
+    # (修正) S&C 演算法的峰值是在 CP 之後, 符元 0 的開頭
+    # 我們需要減去 CP_len 才能得到訊框的真正開頭
+    return peak_idx - CP_len, cfo_phase_per_sample
+# -----------------------------------------------------------------
+
+
+# --- 1. 讀取 Ground Truth 檔案 (由 Tx 產生) ---
+print("Loading Ground Truth and LTF files...")
+try:
+    gt_data = np.load('gt_simple.npz')
+    gt_payload_freq = gt_data['gt_payload_freq'] # 10x48
+    
+    ltf_data = np.load('ltf_data.npz')
+    ltf_freq_known = ltf_data['ltf_freq_known'] # 1x64
+except FileNotFoundError:
+    print("!!! 錯誤: 找不到 'gt_simple.npz' 或 'ltf_data.npz' !!!")
+    print("請先執行 tx_ofdm_simple.py 來產生這些檔案。")
+    exit()
+
+# --- 2. 連接並設定 B200mini ---
+print(f"Connecting to RX USRP (B200mini) at serial={SERIAL_RX}...")
 usrp_rx = uhd.usrp.MultiUSRP(uhd.types.DeviceAddr(f"serial={SERIAL_RX}"))
-
 usrp_rx.set_clock_source("internal")
 usrp_rx.set_time_source("internal")
 usrp_rx.set_time_unknown_pps(uhd.types.TimeSpec(0.0))
-
 usrp_rx.set_rx_subdev_spec(uhd.usrp.SubdevSpec("A:A"), 0)
-usrp_rx.set_rx_antenna("TX/RX", 0) 
+usrp_rx.set_rx_antenna("RX2", 0) # (請確認你的 Rx 天線埠)
 usrp_rx.set_rx_rate(Fs)
 usrp_rx.set_rx_freq(uhd.libpyuhd.types.tune_request(Fc), 0)
-usrp_rx.set_rx_gain(Rx_gain, 0)
-print(f"Rx Rate: {usrp_rx.get_rx_rate()/1e6} MHz, Rx Gain: {usrp_rx.get_rx_gain(0)} dB")
+usrp_rx.set_rx_gain(RX_GAIN, 0)
+print(f"B200mini (Rx) setup complete. Rate: {Fs/1e6} MHz, Freq: {Fc/1e9} GHz, Gain: {RX_GAIN} dB")
 
+# --- 3. 建立串流 ---
 stream_args = uhd.usrp.StreamArgs("fc32", "sc16")
 stream_args.channels = [0]
 rx_streamer = usrp_rx.get_rx_stream(stream_args)
 metadata = uhd.types.RXMetadata()
-
-# --- 3. 讀取本地 Ground Truth ---
-try:
-    gt_data = np.load(GT_FILE)
-    gt_payload = gt_data['gt_payload']
-    if len(gt_payload) != PAYLOAD_LEN:
-        print(f"!!! 錯誤: Ground Truth 檔案長度 ({len(gt_payload)}) 與 Mapper ({PAYLOAD_LEN}) 不符 !!!")
-        exit()
-    print(f"Ground truth payload loaded from {GT_FILE}")
-except FileNotFoundError:
-    print(f"!!! 錯誤: 找不到 Ground Truth 檔案: {GT_FILE} !!!")
-    print("請先執行 tx_siso_ofdm_local.py 來產生此檔案。")
-    exit()
 
 # --- 4. 準備繪圖 ---
 print("Setting up live plot...")
@@ -73,7 +114,7 @@ print("\n*** Starting burst reception loop... (Press Ctrl+C to stop) ***")
 try:
     while True:
         # --- A. 接收一個數據突發 (Burst) ---
-        num_samps_to_recv = int(Fs * 0.5)
+        num_samps_to_recv = int(Fs * 0.5) # 接收 0.5 秒
         recv_buffer = np.zeros(num_samps_to_recv, dtype=np.complex64)
         temp_buffer = np.zeros(10000, dtype=np.complex64)
         
@@ -106,91 +147,102 @@ try:
 
         # --- B. 離線處理 ---
         
-        # 1. 同步 (SISO)
-        rcv_waveform_raw = rcv_waveform_full
-        est_idx = mapper.synchronize(rcv_waveform_raw)
+        # 5. 離線同步 (S&C)
+        print("Starting offline synchronization (Schmidl-Cox)...")
+        peak_idx, cfo_phase = find_schmidl_cox_peak(rcv_waveform_full, FFT_size // 2)
         
-        if est_idx < 0 or (est_idx + N_SAMPLES_PER_FRAME) > num_samps_to_recv:
-            print(f"Sync failed! (est_idx: {est_idx}). Flushing buffer...")
+        if peak_idx <= 0 or (peak_idx + N_SAMPLES_PER_FRAME) > len(rcv_waveform_full):
+            print(f"!!! SYNC FAILED !!! (peak_idx: {peak_idx})")
+            print("無法在訊號中找到 S&C 前導碼。")
             continue
 
-        print(f"Sync success! Frame found at index {est_idx}.")
+        print(f"*** SYNC SUCCESS! *** Found frame at index: {peak_idx}")
 
-        # 2. Rx 通道估測 (SISO)
-        rcv_waveform = rcv_waveform_raw[est_idx : est_idx + N_SAMPLES_PER_FRAME]
+        # 6. (關鍵) CFO 校正
+        # 建立一個與「整個緩衝區」一樣長的校正向量
+        cfo_corr_vector = np.exp(-1j * cfo_phase * np.arange(len(rcv_waveform_full)))
+        recv_buffer_corrected = rcv_waveform_full * cfo_corr_vector
         
-        if pilot_norm != 1:
-            rcv_waveform[822:960] *= 1.7
-            # (!!! 修正 !!!)
-            rcv_waveform = rcv_waveform.reshape(-1, 960)
-            rcv_waveform[:,:138] *= (pilot_norm / np.sqrt(1))
-            rcv_waveform = rcv_waveform.flatten()
+        print("CFO correction applied.")
+
+        # 7. 擷取訊框 (從校正後的緩衝區)
+        frame = recv_buffer_corrected[peak_idx : peak_idx + N_SAMPLES_PER_FRAME]
+        
+        # 8. 通道估測
+        ltf_symbol = frame[symbol_len : symbol_len*2]
+        ltf_symbol_no_cp = ltf_symbol[CP_len:]
+        ltf_freq_rx = np.fft.fft(ltf_symbol_no_cp)
+        channel_H = ltf_freq_rx / ltf_freq_known
+        
+        # 9. 解碼數據
+        all_rx_payloads = []
+        for i in range(N_DATA_SYMBOLS):
+            symbol_start = (i + 2) * symbol_len # +2 是因為 0=SC, 1=LTF
+            symbol_end = symbol_start + symbol_len
             
-        rcv_symbols = mapper.signalToSymbols(rcv_waveform)
-        channels_for_plot = mapper.get_mimo_channel(rcv_symbols) 
+            data_symbol = frame[symbol_start : symbol_end]
+            data_symbol_no_cp = data_symbol[CP_len:]
+            data_freq_rx = np.fft.fft(data_symbol_no_cp)
+            
+            # 均衡 Y_eq = Y / H
+            data_freq_equalized = data_freq_rx / channel_H
+            
+            payload = data_freq_equalized[data_carrier_start:data_carrier_end]
+            all_rx_payloads.append(payload)
+            
+        rx_payload_freq = np.vstack(all_rx_payloads) # (10, 48)
 
-        # 3. SISO 均衡
-        rcv_symbols_eq = mapper.equalize(rcv_symbols)
-
-        # 4. 提取 Payload (SISO)
-        rcv_payload = mapper.extractPayloads(rcv_symbols_eq)
-        rcv_payload = rcv_payload[:PAYLOAD_LEN].astype(np.complex64)
-        
-        rcv_payload *= payload_norm # 反向正規化
-        
-        # --- C. (修改) 本地計算 ESNR ---
-        print("Calculating ESNR...")
-        sym_pow = np.mean(np.abs(gt_payload)**2)
-        err_pow = np.mean(np.abs(gt_payload - rcv_payload)**2)
+        # 10. 計算 ESNR
+        sym_pow = np.mean(np.abs(gt_payload_freq)**2)
+        err_pow = np.mean(np.abs(gt_payload_freq - rx_payload_freq)**2)
         esnr = 10*np.log10(sym_pow / err_pow)
         
+        print(f"\n--- FINAL RESULT ---")
         print(f"--- ESNR: {esnr:.2f} dB ---")
-
-        # --- D. 更新繪圖 (SISO) ---
         
-        # Channel plot
+        # 11. 繪製最終結果
+        
+        # 圖 1: 通道
         ax1.clear()
-        channel_mag = np.abs(np.mean(channels_for_plot, axis=-1).flatten())
-        ax1.plot(channel_mag)
-        ax1.set_xlim([0, 72])
+        ax1.plot(np.abs(channel_H[data_carrier_start:data_carrier_end]), '.-')
+        ax1.set_title(f'Channel Magnitude (H)')
+        ax1.set_xlabel('Data Subcarrier Index')
+        ax1.set_ylabel('Magnitude')
+        ax1.grid(True)
         ax1.set_ylim(bottom=0)
-        ax1.set_xlabel('Subcarrier Index')
-        ax1.set_ylabel('Channel Magnitude')
-        ax1.set_title('SISO Channel Magnitude')
-
-        # PSD
+        
+        # 圖 2: PSD
         ax2.clear()
-        ax2.psd(rcv_waveform_full, NFFT=1024, Fs=Fs, scale_by_freq=False, linewidth=0.5, label='Chan 0')
-        ax2.set_xlabel('Frequency (Hz)')
-        ax2.set_ylabel('Power Spectrum (dB)')
+        ax2.psd(rcv_waveform_full, NFFT=1024, Fs=Fs, scale_by_freq=False, linewidth=0.5)
         ax2.set_title('Received PSD')
+        ax2.set_xlabel('Frequency (Hz)')
 
-        # Constellation
+        # 圖 3: 星座圖
         ax3.clear()
-        ax3.scatter(np.real(rcv_payload), np.imag(rcv_payload), s=0.2, label='Received (Rx)')
-        ax3.scatter(np.real(gt_payload), np.imag(gt_payload), s=2, color='orange', label='Ground Truth (GT)')
+        # (我們比較頻域的 Ground Truth)
+        ax3.scatter(np.real(rx_payload_freq), np.imag(rx_payload_freq), 
+                    s=1, alpha=0.3, label='Received (Rx)')
+        ax3.scatter(np.real(gt_payload_freq), np.imag(gt_payload_freq), 
+                    s=2, color='orange', label='Ground Truth (GT)')
         ax3.set_xlim([-1.5, 1.5]) 
         ax3.set_ylim([-1.5, 1.5])
         ax3.set_xlabel('In-Phase')
         ax3.set_ylabel('Quadrature-Phase')
         ax3.set_title(f'QPSK Constellation | ESNR: {esnr:.2f} dB')
-        ax3.legend()
         ax3.grid(True)
         ax3.set_aspect('equal')
-
+        
         # 刷新 GUI
         fig.canvas.draw()
         fig.canvas.flush_events()
-        plt.pause(0.01) 
-        
+        plt.pause(0.01)
+
 except KeyboardInterrupt:
-    print("\nStopping reception...")
+    print("\nStopping...")
 
 finally:
-    # 關閉串流
     stream_cmd_stop = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
     rx_streamer.issue_stream_cmd(stream_cmd_stop)
-    
     plt.ioff()
     plt.close()
-    print("Rx shut down.")
+    print("Receiver shut down.")
