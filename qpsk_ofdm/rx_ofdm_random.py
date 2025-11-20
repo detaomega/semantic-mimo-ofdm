@@ -5,11 +5,11 @@ import time
 
 # --- 設定 ---
 SERIAL_RX = "34B733A"   # 您的 B200mini 序列號
-RX_GAIN = 50.0
-Fc = 5.4e9
+RX_GAIN = 70.0
+Fc = 5.2e9
 Fs = 1e6
 GT_FILE_LTF = 'ltf_data.npz'
-GT_FILE_PAYLOAD = 'gt_simple.npz'
+GT_FILE_PAYLOAD = 'tx_payload.npz'
 
 # --- OFDM 參數 (必須與 Tx 相同) ---
 FFT_size = 64
@@ -90,7 +90,7 @@ metadata = uhd.types.RXMetadata()
 # --- 4. 準備繪圖 ---
 print("Setting up live plot...")
 plt.ion() 
-fig, (ax1, ax2, ax3) = plt.subplots(ncols=3, nrows=1, figsize=(18, 5))
+fig, (ax2, ax3) = plt.subplots(ncols=2, nrows=1, figsize=(18, 5))
 fig.tight_layout(pad=4.0)
 
 # --- 5. 主接收迴圈 (離線/突發模式) ---
@@ -187,6 +187,7 @@ try:
         # 11. 繪製最終結果
         
         # 圖 1: 通道
+        ''''
         ax1.clear()
         # (!!! 關鍵修改 !!!) 只繪製我們使用的子載波
         channel_mag_used = np.abs(channel_H[data_carrier_indices])
@@ -196,7 +197,7 @@ try:
         ax1.set_ylabel('Magnitude')
         ax1.grid(True)
         ax1.set_ylim(bottom=0)
-        
+        '''
         # 圖 2: PSD
         ax2.clear()
         ax2.psd(rcv_waveform_full, NFFT=1024, Fs=Fs, scale_by_freq=False, linewidth=0.5)
@@ -217,7 +218,7 @@ try:
         ax3.set_ylim([-1.5, 1.5])
         ax3.set_xlabel('In-Phase')
         ax3.set_ylabel('Quadrature-Phase')
-        ax3.set_title(f'Arbitrary Constellation | ESNR: {esnr:.2f} dB')
+        ax3.set_title(f'Arbitrary Constellation | MSE: {err_pow:.6f}')
         ax3.grid(True)
         ax3.set_aspect('equal')
         

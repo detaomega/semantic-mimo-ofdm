@@ -8,7 +8,7 @@ TX_GAIN = 70.0
 Fc = 5.4e9
 Fs = 1e6
 GT_FILE_LTF = 'ltf_data.npz'
-GT_FILE_PAYLOAD = 'gt_simple.npz'
+GT_FILE_PAYLOAD = 'tx_payload.npz'
 
 # --- OFDM 參數 ---
 FFT_size = 64
