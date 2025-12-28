@@ -8,7 +8,7 @@ def transmit(serial=""):
     device_args = "type=b200"
     if serial: device_args += f",serial={serial}"
     
-    print(f"--- QPSK 發射機 ---")
+    print(f"--- OFDM-QPSK 發射機 ---")
     print(f"Gain: {config.TX_GAIN} dB")
     
     usrp = uhd.usrp.MultiUSRP(device_args)
@@ -16,21 +16,27 @@ def transmit(serial=""):
     usrp.set_tx_freq(uhd.types.TuneRequest(config.CENTER_FREQ))
     usrp.set_tx_gain(config.TX_GAIN)
     
-    # 建立封包：重複發送 QPSK 序列
-    # 為了效率，我們一次發送重複 10 次的大封包
-    tx_data = np.tile(config.QPSK_SEQ, 10)
+    # 封包結構：[靜音] + [Preamble] + [Data] + [Data] + [靜音]
+    # 連續發送兩個 Data Symbol 以增加穩定性
+    silence = np.zeros(50, dtype=np.complex64)
+    packet = np.concatenate([
+        silence, 
+        config.PREAMBLE_SYMBOL, 
+        config.DATA_SYMBOL, 
+        config.DATA_SYMBOL, 
+        silence
+    ])
     
     streamer = usrp.get_tx_stream(uhd.usrp.StreamArgs("fc32", "sc16"))
     md = uhd.types.TXMetadata()
     
-    print(">> 正在連續發送 QPSK 星座點...")
+    print(">> 正在發送 OFDM + QPSK 訊號...")
     
     try:
         while True:
             md.start_of_burst = True
             md.end_of_burst = True
-            streamer.send(tx_data, md)
-            # 極短暫停，避免 buffer underflow 但保持連續性
+            streamer.send(packet, md)
             time.sleep(0.001) 
             
     except KeyboardInterrupt:
