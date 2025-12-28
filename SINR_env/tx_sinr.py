@@ -12,7 +12,6 @@ def transmit_beacon(serial=""):
     
     print(f"--- 初始化發射機 (TX) ---")
     print(f"裝置: {device_args}")
-    print(f"頻率: {config.CENTER_FREQ/1e6} MHz")
     print(f"增益: {config.TX_GAIN} dB")
     
     usrp = uhd.usrp.MultiUSRP(device_args)
@@ -36,19 +35,16 @@ def transmit_beacon(serial=""):
     
     try:
         while True:
-            # 發送一次 burst
             md.start_of_burst = True
             md.end_of_burst = True
             streamer.send(tx_packet, md)
-            
-            # 發送間隔 (秒)
-            time.sleep(0.05)
+            time.sleep(0.05) # 每 0.05 秒發送一次
             
     except KeyboardInterrupt:
         print("\n停止發送")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--serial", type=str, default="", help="B210 發射機的 Serial Number")
+    parser.add_argument("--serial", type=str, default="", help="TX Serial Number")
     args = parser.parse_args()
     transmit_beacon(args.serial)
