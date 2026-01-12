@@ -11,7 +11,7 @@ Fs = 1e6
 
 # 檔案路徑
 GT_FILE_LTF = 'ltf_data.npz'
-GT_FILE_PAYLOAD = 'tx_payload.npy' # 這是 JSCC sender 產出的 .npy
+GT_FILE_PAYLOAD = 'transmit_payload.npy' # 這是 JSCC sender 產出的 .npy
 
 # --- OFDM 參數 ---
 FFT_size = 64
