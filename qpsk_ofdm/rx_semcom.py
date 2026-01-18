@@ -7,7 +7,7 @@ from datetime import datetime
 
 # --- 設定 ---
 SERIAL_RX = "34B733A"   # 請確認您的 B200mini 序列號
-RX_GAIN = 40.0          
+RX_GAIN = 65.0          
 Fc = 5.2e9
 Fs = 1e6
 GT_FILE_LTF = 'ltf_data.npz'
@@ -145,6 +145,12 @@ try:
         rx_payload_matrix = np.vstack(all_rx_payloads) 
         
         # --- 計算誤差 ---
+        error_vector = rx_payload_matrix - gt_payload_freq
+        signal_power = np.mean(np.abs(gt_payload_freq) ** 2)
+        noise_power = np.mean(np.abs(error_vector) ** 2)
+        if noise_power == 0: noise_power = 1e-12 # 避免除以零
+        global_sinr_db = 10 * np.log10(signal_power / noise_power)
+
         err_pow = np.mean(np.abs(gt_payload_freq - rx_payload_matrix)**2)
         esnr = 10*np.log10(1.0 / err_pow) 
 
@@ -156,12 +162,12 @@ try:
         
         # (!!! 關鍵修改: 產生帶時間戳的檔名 !!!)
         timestamp = datetime.now().strftime("%H%M%S_%f")[:9] # 時分秒_微秒(取前3位)
-        filename = f"rx_{timestamp}_mse{err_pow:.4f}.npy"
+        filename = f"rx_{timestamp}_SINR{global_sinr_db:.4f}.npy"
         file_path = os.path.join(SAVE_DIR, filename)
         
         np.save(file_path, save_payload)
         
-        print(f"Saved: {filename} | ESNR: {esnr:.2f} dB")
+        print(f"Saved: {filename} | SINR: {global_sinr_db:.2f} dB")
 
         # --- 繪圖 ---
         ax2.clear()
