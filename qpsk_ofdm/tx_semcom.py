@@ -11,7 +11,7 @@ Fs = 1e6
 
 # 檔案路徑
 GT_FILE_LTF = 'ltf_data.npz'
-GT_FILE_PAYLOAD = 'transmit_payload.npy' # 這是 JSCC sender 產出的 .npy
+GT_FILE_PAYLOAD = 'tx_play.npy' # 這是 JSCC sender 產出的 .npy
 
 # --- OFDM 參數 ---
 FFT_size = 64
@@ -98,7 +98,12 @@ try:
     print(f"Reshaping: Requires {n_symbols} OFDM symbols (Padding {n_padding} zeros)")
     
     # 補零
-    padded_data = np.pad(flat_complex_data, (0, n_padding), 'constant')
+    padded_data = np.pad(
+        flat_complex_data, 
+        (0, n_padding), 
+        'constant', 
+        constant_values=(1 + 0j)
+    )
     
     # Reshape 成 (11, 48)
     payload_freq_matrix = padded_data.reshape(n_symbols, num_data_carriers)
