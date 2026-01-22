@@ -4,9 +4,9 @@ import time
 import sys
 
 # --- 設定 ---
-SERIAL_TX = "3475843"   # 你的 B210/Tx 序列號
+SERIAL_TX = "34B1898"   # 你的 B210/Tx 序列號
 TX_GAIN = 70.0          # 根據實驗距離調整，太近可以調低 (e.g. 50)
-Fc = 5.4e9
+Fc = 5.2e9
 Fs = 1e6
 
 # 檔案路徑
